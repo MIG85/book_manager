@@ -6,6 +6,8 @@ import hashlib
 import logging
 import chardet
 import redis
+import base64
+import binascii
 from lxml import etree
 from zipfile import ZipFile
 from django.core.files import File
@@ -88,10 +90,14 @@ def extract_cover_from_fb2(file_path):
             if href and href.startswith('#'):
                 binary = tree.find(f"fb:binary[@id='{href[1:]}']", namespaces=ns)
                 if binary is not None and binary.text:
-                    return binary.text.encode(encoding).decode('utf-8', errors='replace')
+                    base64_data = binary.text.strip()
+                    try:
+                        return base64.b64decode(base64_data)
+                    except (TypeError, binascii.Error) as e:
+                        logger.error(f"Base64 decode error: {str(e)}")
         return None
     except Exception as e:
-        logger.error(f"Cover extraction failed: {str(e)}")
+        logger.error(f"Cover extraction failed: {str(e)}", exc_info=True)
         return None
 
 def extract_meta_from_fb2(file_path):
@@ -215,11 +221,11 @@ def process_single_file(file_path, root_path, parent_archive=None, rel_in_archiv
             try:
                 book.cover.save(
                     f"{file_hash}.jpg",
-                    ContentFile(meta['cover'].encode('utf-8')),
+                    ContentFile(meta['cover']),
                     save=True
                 )
-            except UnicodeEncodeError:
-                logger.warning(f"Cover encoding error for {file_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save cover: {str(e)}")
 
         for author_data in meta['authors']:
             author, _ = Author.objects.get_or_create(
