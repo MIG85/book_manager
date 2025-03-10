@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="row">
+        <!-- Блок с обложкой -->
+        <div class="col-md-4">
+            {% if book.cover %}
+            <img src="{{ book.cover.url }}" 
+                 class="img-fluid rounded shadow-lg" 
+                 alt="Обложка книги {{ book.title }}"
+                 style="max-height: 500px; object-fit: contain;">
+            {% else %}
+            <div class="alert alert-warning">
+                <i class="bi bi-image"></i> Обложка отсутствует
+            </div>
+            {% endif %}
+        </div>
+
+        <!-- Блок с информацией -->
+        <div class="col-md-8">
+            <h1 class="mb-3">{{ book.title }}</h1>
+            
+            <!-- Авторы -->
+            <div class="mb-4">
+                <h4>Авторы:</h4>
+                <div class="d-flex flex-wrap gap-2">
+                    {% for author in book.authors.all %}
+                    <a href="{% url 'books:alpha-filter' 'author' author.last_name.0 %}" 
+                       class="badge bg-primary text-decoration-none">
+                        {{ author.last_name }} {{ author.first_name }}
+                    </a>
+                    {% empty %}
+                    <span class="text-muted">Автор не указан</span>
+                    {% endfor %}
+                </div>
+            </div>
+
+            <!-- Серия -->
+            {% if book.series %}
+            <div class="mb-4">
+                <h4>Серия:</h4>
+                <p>
+                    <a href="{% url 'books:alpha-filter' 'series' book.series.title.0 %}" 
+                       class="text-decoration-none">
+                        {{ book.series.title }}
+                        {% if book.series_number %}
+                        <span class="badge bg-secondary">Книга {{ book.series_number }}</span>
+                        {% endif %}
+                    </a>
+                </p>
+            </div>
+            {% endif %}
+
+            <!-- Описание -->
+            {% if book.description %}
+            <div class="mb-4">
+                <h4>Описание:</h4>
+                <p class="text-muted">{{ book.description|linebreaks }}</p>
+            </div>
+            {% endif %}
+
+            <!-- Ключевые слова -->
+            {% if book.keywords.all %}
+            <div class="mb-4">
+                <h4>Теги:</h4>
+                <div class="d-flex flex-wrap gap-2">
+                    {% for keyword in book.keywords.all %}
+                    <a href="{% url 'books:alpha-filter' 'genre' keyword.name.0 %}" 
+                       class="badge bg-success text-decoration-none">
+                        {{ keyword.name }}
+                    </a>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endif %}
+
+            <!-- Блок действий -->
+            <div class="mt-4 border-top pt-3">
+                <a href="{% url 'books:download-book' book.pk %}" 
+                   class="btn btn-lg btn-success">
+                    <i class="bi bi-download"></i> Скачать книгу
+                </a>
+                <a href="{% url 'books:book-list' %}" 
+                   class="btn btn-lg btn-outline-secondary">
+                    <i class="bi bi-arrow-left"></i> Назад к списку
+                </a>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

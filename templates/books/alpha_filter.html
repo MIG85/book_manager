@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container">
+    <h2>Фильтр по {{ model_type|title }}: {{ letter }}</h2>
+    
+    {% include "includes/alpha_nav.html" with model_type=model_type current_letter=letter %}
+    
+    <div class="list-group mt-4">
+        {% for item in items %}
+        <a href="{% if model_type == 'author' %}{% url 'books:book-search' %}?q={{ item.last_name }}{% else %}#{% endif %}" 
+           class="list-group-item list-group-item-action">
+            {% if model_type == 'series' %}
+                {{ item.title }}
+                {% if item.description %}
+                <div class="text-muted small mt-1">{{ item.description|truncatechars:50 }}</div>
+                {% endif %}
+            {% elif model_type == 'genre' %}
+                {{ item.name }}
+            {% elif model_type == 'author' %}
+                {{ item.last_name }} {{ item.first_name }} {{ item.middle_name|default:"" }}
+            {% else %}
+                {{ item }}
+            {% endif %}
+        </a>
+        {% empty %}
+        <div class="alert alert-info">Ничего не найдено</div>
+        {% endfor %}
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,19 @@
+<div class="my-4">
+    <div class="mb-2">
+        {% for letter in "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ" %}
+        <a href="{% url 'books:alpha-filter' model_type=model_type letter=letter %}" 
+           class="btn btn-sm {% if letter == current_letter %}btn-primary{% else %}btn-outline-secondary{% endif %}">
+            {{ letter }}
+        </a>
+        {% endfor %}
+    </div>
+    
+    <div class="mt-2">
+        {% for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" %}
+        <a href="{% url 'books:alpha-filter' model_type=model_type letter=letter %}" 
+           class="btn btn-sm {% if letter == current_letter %}btn-primary{% else %}btn-outline-secondary{% endif %}">
+            {{ letter }}
+        </a>
+        {% endfor %}
+    </div>
+</div>

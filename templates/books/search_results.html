@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container">
+    {% if query %}
+    <h2>Результаты поиска: "{{ query }}"</h2>
+    {% else %}
+    <h2>Все книги</h2>
+    {% endif %}
+    
+    <div class="row row-cols-1 row-cols-md-3 g-4 mt-2">
+        {% for book in page_obj %}
+        <div class="col">
+            <div class="card h-100">
+                {% if book.cover %}
+                <img src="{{ book.cover.url }}" 
+                     class="card-img-top" 
+                     alt="Обложка"
+                     style="max-height: 300px; object-fit: contain;">
+                {% endif %}
+                <div class="card-body">
+                    <h5 class="card-title">{{ book.title }}</h5>
+                    <p class="card-text">
+                        {% for author in book.authors.all %}
+                        <span class="badge bg-secondary mb-1">
+                            {{ author.last_name }} {{ author.first_name }}
+                        </span>
+                        {% endfor %}
+                    </p>
+                    <a href="{% url 'books:book-detail' book.pk %}" 
+                       class="btn btn-primary">
+                        Подробнее
+                    </a>
+                </div>
+            </div>
+        </div>
+        {% empty %}
+        <div class="col">
+            <div class="alert alert-info">Книги не найдены</div>
+        </div>
+        {% endfor %}
+    </div>
+    
+    {% include "includes/pagination.html" %}
+</div>
+{% endblock %}
