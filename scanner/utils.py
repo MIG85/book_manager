@@ -1,13 +1,15 @@
 import os
-import patoolib
+import zipfile
+import rarfile
 import magic
 import tempfile
 import hashlib
 import logging
 import chardet
 import redis
+import base64
+import binascii
 from lxml import etree
-from zipfile import ZipFile
 from django.core.files import File
 from django.conf import settings
 from books.models import Book, Author, Series, Keyword
@@ -19,10 +21,10 @@ redis_client = redis.Redis(
     db=settings.REDIS_DB
 )
 
-SUPPORTED_ARCHIVE_FORMATS = [
-    'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz',
-    'iso', 'lzh', 'cab', 'ace', 'arj', 'z', 'lha'
-]
+SUPPORTED_ARCHIVE_FORMATS = {
+    'application/zip': 'zip',
+    'application/x-rar-compressed': 'rar'
+}
 
 SUPPORTED_BOOK_FORMATS = {
     'application/x-fictionbook': 'fb2',
@@ -45,16 +47,6 @@ def calculate_file_hash(file_path):
             sha.update(chunk)
     return sha.hexdigest()
 
-def is_archive_file(file_path):
-    try:
-        fmt = patoolib.get_archive_format(file_path)
-        return fmt and fmt[0] in SUPPORTED_ARCHIVE_FORMATS
-    except patoolib.util.PatoolError:
-        return False
-    except Exception as e:
-        logger.warning(f"Archive check error: {str(e)}")
-        return False
-
 def get_file_mime_type(file_path):
     try:
         return magic.from_file(file_path, mime=True)
@@ -62,14 +54,180 @@ def get_file_mime_type(file_path):
         logger.warning(f"MIME detection error: {str(e)}")
         return None
 
-def detect_encoding(file_path):
+def detect_encoding(content):
     try:
-        with open(file_path, 'rb') as f:
-            raw_data = f.read(1024)
-            return chardet.detect(raw_data)['encoding'] or 'utf-8'
+        return chardet.detect(content)['encoding'] or 'utf-8'
     except Exception as e:
         logger.warning(f"Encoding detection failed: {str(e)}")
         return 'utf-8'
+
+def process_archive(file_path, root_path, parent_archive=None):
+    try:
+        if not acquire_lock(file_path):
+            logger.warning(f"File locked: {file_path}")
+            return
+
+        mime = get_file_mime_type(file_path)
+        archive_type = SUPPORTED_ARCHIVE_FORMATS.get(mime)
+
+        if not archive_type:
+            return
+
+        handler = {
+            'zip': handle_zip,
+            'rar': handle_rar
+        }[archive_type]
+
+        handler(file_path, root_path, parent_archive)
+
+    except Exception as e:
+        logger.error(f"Archive processing failed: {str(e)}")
+    finally:
+        release_lock(file_path)
+
+def handle_zip(zip_path, root_path, parent_archive):
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            for file_info in zf.infolist():
+                if file_info.is_dir():
+                    continue
+
+                with zf.open(file_info) as file:
+                    content = file.read()
+                    process_archive_content(
+                        content=content,
+                        file_name=file_info.filename,
+                        root_path=root_path,
+                        parent_archive=zip_path,
+                        is_archive_check=lambda c: check_compressed_type(c, zipfile.is_zipfile)
+                    )
+    except Exception as e:
+        logger.error(f"ZIP processing error: {str(e)}")
+
+def handle_rar(rar_path, root_path, parent_archive):
+    try:
+        with rarfile.RarFile(rar_path) as rf:
+            for file_info in rf.infolist():
+                if file_info.isdir():
+                    continue
+
+                with rf.open(file_info) as file:
+                    content = file.read()
+                    process_archive_content(
+                        content=content,
+                        file_name=file_info.filename,
+                        root_path=root_path,
+                        parent_archive=rar_path,
+                        is_archive_check=lambda c: check_compressed_type(c, rarfile.is_rarfile)
+                    )
+    except Exception as e:
+        logger.error(f"RAR processing error: {str(e)}")
+
+def check_compressed_type(content, checker):
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(content)
+        tmp.close()
+        try:
+            return checker(tmp.name)
+        finally:
+            os.unlink(tmp.name)
+
+def process_archive_content(content, file_name, root_path, parent_archive, is_archive_check):
+    try:
+        if is_archive_check(content):
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                tmp.write(content)
+                tmp.close()
+                process_archive(tmp.name, root_path, parent_archive)
+                return
+        else:
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                tmp.write(content)
+                tmp.close()
+                process_single_file(
+                    tmp.name,
+                    root_path,
+                    parent_archive=parent_archive,
+                    rel_in_archive=file_name
+                )
+    finally:
+        if os.path.exists(tmp.name):
+            os.unlink(tmp.name)
+
+def process_single_file(file_path, root_path, parent_archive=None, rel_in_archive=None):
+    try:
+        file_hash = calculate_file_hash(file_path)
+        
+        if Book.objects.filter(file_hash=file_hash).exists():
+            logger.info(f"Skipping duplicate: {file_path}")
+            return
+
+        mime = get_file_mime_type(file_path)
+        if not mime or mime not in SUPPORTED_BOOK_FORMATS:
+            return
+
+        meta = None
+        book_format = SUPPORTED_BOOK_FORMATS[mime]
+        
+        if book_format == 'fb2':
+            meta = extract_meta_from_fb2(file_path)
+        elif book_format == 'epub':
+            meta = extract_meta_from_epub(file_path)
+
+        if not meta:
+            return
+
+        series = None
+        if meta['series']:
+            series, _ = Series.objects.get_or_create(
+                title=meta['series'],
+                defaults={'description': meta.get('series_description', '')}
+            )
+
+        book_data = {
+            'title': meta['title'][:500],
+            'description': meta['description'][:5000],
+            'file_path': os.path.relpath(parent_archive, root_path) if parent_archive else os.path.relpath(file_path, root_path),
+            'file_archive': os.path.relpath(parent_archive, root_path) if parent_archive else None,
+            'file_in_archive': rel_in_archive,
+            'lang': (meta['lang'][:2] if meta['lang'] else 'ru').lower(),
+            'file_hash': file_hash,
+            'series': series,
+            'series_number': meta['series_number']
+        }
+
+        book, created = Book.objects.update_or_create(
+            file_hash=file_hash,
+            defaults=book_data
+        )
+
+        if meta['cover']:
+            from django.core.files.base import ContentFile
+            try:
+                book.cover.save(
+                    f"{file_hash}.jpg",
+                    ContentFile(meta['cover']),
+                    save=True
+                )
+            except Exception as e:
+                logger.warning(f"Failed to save cover: {str(e)}")
+
+        for author_data in meta['authors']:
+            author, _ = Author.objects.get_or_create(
+                last_name=author_data['last_name'][:100],
+                first_name=author_data['first_name'][:100],
+                defaults={'middle_name': author_data['middle_name'][:100]}
+            )
+            book.authors.add(author)
+
+        for keyword in meta['keywords']:
+            kw, _ = Keyword.objects.get_or_create(name=keyword[:100])
+            book.keywords.add(kw)
+
+        logger.info(f"{'Created' if created else 'Updated'} book: {book.title}")
+
+    except Exception as e:
+        logger.error(f"File processing failed: {str(e)}")
 
 def extract_cover_from_fb2(file_path):
     try:
@@ -162,122 +320,3 @@ def extract_meta_from_fb2(file_path):
     except Exception as e:
         logger.error(f"FB2 processing error: {str(e)}")
         return None
-
-def process_single_file(file_path, root_path, parent_archive=None, rel_in_archive=None):
-    try:
-        file_hash = calculate_file_hash(file_path)
-        
-        if Book.objects.filter(file_hash=file_hash).exists():
-            logger.info(f"Skipping duplicate: {file_path}")
-            return
-
-        mime = get_file_mime_type(file_path)
-        if not mime or mime not in SUPPORTED_BOOK_FORMATS:
-            return
-
-        meta = None
-        book_format = SUPPORTED_BOOK_FORMATS[mime]
-        
-        if book_format == 'fb2':
-            meta = extract_meta_from_fb2(file_path)
-        elif book_format == 'epub':
-            meta = extract_meta_from_epub(file_path)
-
-        if not meta:
-            return
-
-        series = None
-        if meta['series']:
-            series, _ = Series.objects.get_or_create(
-                title=meta['series'],
-                defaults={'description': meta.get('series_description', '')}
-            )
-
-        book_data = {
-            'title': meta['title'][:500],
-            'description': meta['description'][:5000],
-            'file_path': os.path.relpath(parent_archive, root_path) if parent_archive else os.path.relpath(file_path, root_path),
-            'file_archive': os.path.relpath(parent_archive, root_path) if parent_archive else None,
-            'file_in_archive': rel_in_archive,
-            'lang': (meta['lang'][:2] if meta['lang'] else 'ru').lower(),
-            'file_hash': file_hash,
-            'series': series,
-            'series_number': meta['series_number']
-        }
-
-        book, created = Book.objects.update_or_create(
-            file_hash=file_hash,
-            defaults=book_data
-        )
-
-        if meta['cover']:
-            from django.core.files.base import ContentFile
-            try:
-                book.cover.save(
-                    f"{file_hash}.jpg",
-                    ContentFile(meta['cover'].encode('utf-8')),
-                    save=True
-                )
-            except UnicodeEncodeError:
-                logger.warning(f"Cover encoding error for {file_path}")
-
-        for author_data in meta['authors']:
-            author, _ = Author.objects.get_or_create(
-                last_name=author_data['last_name'][:100],
-                first_name=author_data['first_name'][:100],
-                defaults={'middle_name': author_data['middle_name'][:100]}
-            )
-            book.authors.add(author)
-
-        for keyword in meta['keywords']:
-            kw, _ = Keyword.objects.get_or_create(name=keyword[:100])
-            book.keywords.add(kw)
-
-        logger.info(f"{'Created' if created else 'Updated'} book: {book.title}")
-
-    except UnicodeDecodeError as e:
-        logger.error(f"Unicode error in {file_path}: {str(e)}")
-    except Exception as e:
-        logger.error(f"File processing failed: {str(e)}")
-        raise
-
-def process_archive(file_path, root_path, parent_archive=None):
-    try:
-        if not acquire_lock(file_path):
-            logger.warning(f"File locked: {file_path}")
-            return
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            if is_archive_file(file_path):
-                patoolib.extract_archive(file_path, outdir=tmp_dir)
-                
-                for root, dirs, files in os.walk(tmp_dir):
-                    for f in files:
-                        full_path = os.path.join(root, f)
-                        rel_in_archive = os.path.relpath(full_path, tmp_dir)
-                        
-                        if is_archive_file(full_path):
-                            process_archive(full_path, root_path, file_path)
-                        else:
-                            process_single_file(
-                                full_path, 
-                                root_path,
-                                parent_archive=file_path,
-                                rel_in_archive=rel_in_archive
-                            )
-            else:
-                process_single_file(
-                    file_path, 
-                    root_path,
-                    parent_archive=parent_archive,
-                    rel_in_archive=None
-                )
-    except patoolib.util.PatoolError as e:
-        logger.error(f"Archive extraction failed: {str(e)}")
-    except UnicodeDecodeError as e:
-        logger.error(f"Archive encoding error: {str(e)}")
-    except Exception as e:
-        logger.error(f"Archive processing failed: {str(e)}")
-        raise
-    finally:
-        release_lock(file_path)
