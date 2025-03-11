@@ -10,6 +10,7 @@ import redis
 import base64
 import binascii
 from lxml import etree
+from io import BytesIO
 from django.core.files import File
 from django.conf import settings
 from books.models import Book, Author, Series, Keyword
@@ -21,9 +22,10 @@ redis_client = redis.Redis(
     db=settings.REDIS_DB
 )
 
-SUPPORTED_ARCHIVE_FORMATS = {
+SUPPORTED_ARCHIVE_TYPES = {
     'application/zip': 'zip',
-    'application/x-rar-compressed': 'rar'
+    'application/x-rar-compressed': 'rar',
+    'application/vnd.rar': 'rar'
 }
 
 SUPPORTED_BOOK_FORMATS = {
@@ -47,112 +49,163 @@ def calculate_file_hash(file_path):
             sha.update(chunk)
     return sha.hexdigest()
 
-def get_file_mime_type(file_path):
-    try:
-        return magic.from_file(file_path, mime=True)
-    except Exception as e:
-        logger.warning(f"MIME detection error: {str(e)}")
-        return None
+def get_archive_type(file_path):
+    mime = magic.from_file(file_path, mime=True)
+    return SUPPORTED_ARCHIVE_TYPES.get(mime)
 
-def detect_encoding(content):
+def detect_encoding(file_path):
     try:
-        return chardet.detect(content)['encoding'] or 'utf-8'
+        with open(file_path, 'rb') as f:
+            raw_data = f.read(1024)
+
+        detected = chardet.detect(raw_data)
+        encoding = detected['encoding'] or 'utf-8'
+        
+        # Нормализация названия кодировки
+        if isinstance(encoding, bytes):
+            encoding = encoding.decode('utf-8', 'ignore')
+        encoding = (
+            str(encoding)
+            .lower()
+            .replace('b\'', '')
+            .replace('\'', '')
+            .replace('utf-8-sig', 'utf-8')
+            .replace('utf_8', 'utf-8')
+            .replace('windows-1251', 'cp1251')
+            .strip()
+        )
+
+        # Проверка валидности кодировки
+        try:
+            'test'.encode(encoding)
+            return encoding
+        except LookupError:
+            return 'utf-8'
+            
     except Exception as e:
         logger.warning(f"Encoding detection failed: {str(e)}")
         return 'utf-8'
 
-def process_archive(file_path, root_path, parent_archive=None):
+def extract_cover_from_fb2(file_path):
     try:
-        if not acquire_lock(file_path):
-            logger.warning(f"File locked: {file_path}")
-            return
-
-        mime = get_file_mime_type(file_path)
-        archive_type = SUPPORTED_ARCHIVE_FORMATS.get(mime)
-
-        if not archive_type:
-            return
-
-        handler = {
-            'zip': handle_zip,
-            'rar': handle_rar
-        }[archive_type]
-
-        handler(file_path, root_path, parent_archive)
-
+        with open(file_path, 'rb') as f:
+            raw_data = f.read()
+        
+        # Удаление BOM
+        bom = b'\xef\xbb\xbf'
+        if raw_data.startswith(bom):
+            raw_data = raw_data[len(bom):]
+        
+        encoding = detect_encoding(file_path)
+        parser = etree.XMLParser(recover=True, encoding=encoding)
+        tree = etree.fromstring(raw_data, parser=parser)
+        
+        ns = {'fb': 'http://www.gribuser.ru/xml/fictionbook/2.0'}
+        cover = tree.find('fb:description/fb:title-info/fb:coverpage/fb:image', namespaces=ns)
+        
+        if cover is not None:
+            href = cover.get('{http://www.w3.org/1999/xlink}href')
+            if href and href.startswith('#'):
+                binary = tree.find(f"fb:binary[@id='{href[1:]}']", namespaces=ns)
+                if binary is not None and binary.text:
+                    base64_data = binary.text.strip()
+                    try:
+                        return base64.b64decode(base64_data)
+                    except (TypeError, binascii.Error) as e:
+                        logger.error(f"Base64 decode error: {str(e)}")
+        return None
     except Exception as e:
-        logger.error(f"Archive processing failed: {str(e)}")
-    finally:
-        release_lock(file_path)
+        logger.error(f"Cover extraction failed: {str(e)}", exc_info=True)
+        return None
 
-def handle_zip(zip_path, root_path, parent_archive):
+def extract_meta_from_fb2(file_path):
     try:
-        with zipfile.ZipFile(zip_path) as zf:
-            for file_info in zf.infolist():
-                if file_info.is_dir():
-                    continue
-
-                with zf.open(file_info) as file:
-                    content = file.read()
-                    process_archive_content(
-                        content=content,
-                        file_name=file_info.filename,
-                        root_path=root_path,
-                        parent_archive=zip_path,
-                        is_archive_check=lambda c: check_compressed_type(c, zipfile.is_zipfile)
-                    )
-    except Exception as e:
-        logger.error(f"ZIP processing error: {str(e)}")
-
-def handle_rar(rar_path, root_path, parent_archive):
-    try:
-        with rarfile.RarFile(rar_path) as rf:
-            for file_info in rf.infolist():
-                if file_info.isdir():
-                    continue
-
-                with rf.open(file_info) as file:
-                    content = file.read()
-                    process_archive_content(
-                        content=content,
-                        file_name=file_info.filename,
-                        root_path=root_path,
-                        parent_archive=rar_path,
-                        is_archive_check=lambda c: check_compressed_type(c, rarfile.is_rarfile)
-                    )
-    except Exception as e:
-        logger.error(f"RAR processing error: {str(e)}")
-
-def check_compressed_type(content, checker):
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        tmp.write(content)
-        tmp.close()
+        with open(file_path, 'rb') as f:
+            raw_data = f.read()
+        
+        # Удаление BOM
+        bom = b'\xef\xbb\xbf'
+        if raw_data.startswith(bom):
+            raw_data = raw_data[len(bom):]
+            
+        encoding = detect_encoding(file_path)
+        
+        # Форсируем UTF-8 если невалидная кодировка
         try:
-            return checker(tmp.name)
-        finally:
-            os.unlink(tmp.name)
+            etree.XMLParser(encoding=encoding)
+        except LookupError:
+            encoding = 'utf-8'
+            
+        parser = etree.XMLParser(
+            encoding=encoding,
+            recover=True,
+            resolve_entities=False
+        )
+        
+        tree = etree.fromstring(raw_data, parser=parser)
+        
+        ns = {'fb': 'http://www.gribuser.ru/xml/fictionbook/2.0'}
+        meta = {
+            'title': "Без названия",
+            'authors': [],
+            'series': None,
+            'series_number': None,
+            'lang': 'ru',
+            'description': '',
+            'keywords': [],
+            'cover': None
+        }
 
-def process_archive_content(content, file_name, root_path, parent_archive, is_archive_check):
-    try:
-        if is_archive_check(content):
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                tmp.write(content)
-                tmp.close()
-                process_archive(tmp.name, root_path, parent_archive)
-                return
-        else:
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                tmp.write(content)
-                tmp.close()
-                process_single_file(
-                    tmp.name,
-                    root_path,
-                    parent_archive=parent_archive,
-                    rel_in_archive=file_name
-                )
-    finally:
-        if os.path.exists(tmp.name):
-            os.unlink(tmp.name)
+        root = tree
+        lang = root.get('lang', 'ru')
+        meta['lang'] = lang.split('-')[0].lower() if lang else 'ru'
+        meta['cover'] = extract_cover_from_fb2(file_path)
+
+        title_info = root.find('fb:description/fb:title-info', namespaces=ns)
+        if title_info is not None:
+            title = title_info.findtext('fb:book-title', namespaces=ns)
+            meta['title'] = title.strip() if title else meta['title']
+
+            for author in title_info.findall('fb:author', namespaces=ns):
+                first = author.findtext('fb:first-name', namespaces=ns, default='').strip()
+                last = author.findtext('fb:last-name', namespaces=ns, default='').strip()
+                middle = author.findtext('fb:middle-name', namespaces=ns, default='').strip()
+                meta['authors'].append({
+                    'first_name': first,
+                    'last_name': last,
+                    'middle_name': middle
+                })
+
+            sequence = title_info.find('fb:sequence', namespaces=ns)
+            if sequence is not None:
+                meta['series'] = sequence.get('name', '').strip()
+                try:
+                    meta['series_number'] = float(sequence.get('number', 0))
+                except (ValueError, TypeError):
+                    meta['series_number'] = None
+
+            for genre in title_info.findall('fb:genre', namespaces=ns):
+                if genre.text:
+                    meta['keywords'].append(genre.text.strip().replace('\n', ' '))
+
+            annotation = title_info.find('fb:annotation', namespaces=ns)
+            if annotation is not None:
+                texts = []
+                for elem in annotation.iter():
+                    if elem.text and elem.tag != '{http://www.gribuser.ru/xml/fictionbook/2.0}annotation':
+                        texts.append(elem.text.strip().replace('\n', ' '))
+                meta['description'] = ' '.join(texts)
+
+        return meta
+    except etree.XMLSyntaxError as e:
+        logger.error(f"Invalid XML in {file_path}: {str(e)}")
+        return None
+    except UnicodeDecodeError as e:
+        logger.error(f"Encoding error in {file_path}: {str(e)}")
+        return None
+    except Exception as e:
+        logger.error(f"FB2 processing error: {str(e)}")
+        return None
 
 def process_single_file(file_path, root_path, parent_archive=None, rel_in_archive=None):
     try:
@@ -162,7 +215,7 @@ def process_single_file(file_path, root_path, parent_archive=None, rel_in_archiv
             logger.info(f"Skipping duplicate: {file_path}")
             return
 
-        mime = get_file_mime_type(file_path)
+        mime = magic.from_file(file_path, mime=True)
         if not mime or mime not in SUPPORTED_BOOK_FORMATS:
             return
 
@@ -226,97 +279,86 @@ def process_single_file(file_path, root_path, parent_archive=None, rel_in_archiv
 
         logger.info(f"{'Created' if created else 'Updated'} book: {book.title}")
 
+    except UnicodeDecodeError as e:
+        logger.error(f"Unicode error in {file_path}: {str(e)}")
     except Exception as e:
         logger.error(f"File processing failed: {str(e)}")
+        raise
 
-def extract_cover_from_fb2(file_path):
+def process_archive(file_path, root_path, parent_archive=None, depth=0):
+    if depth > 5:
+        logger.warning(f"Max archive nesting depth reached: {file_path}")
+        return
+
+    if not acquire_lock(file_path):
+        logger.warning(f"File locked: {file_path}")
+        return
+
     try:
-        with open(file_path, 'rb') as f:
-            raw_data = f.read()
-        
-        encoding = detect_encoding(file_path)
-        parser = etree.XMLParser(recover=True, encoding=encoding)
-        tree = etree.fromstring(raw_data, parser=parser)
-        
-        ns = {'fb': 'http://www.gribuser.ru/xml/fictionbook/2.0'}
-        cover = tree.find('fb:description/fb:title-info/fb:coverpage/fb:image', namespaces=ns)
-        
-        if cover is not None:
-            href = cover.get('{http://www.w3.org/1999/xlink}href')
-            if href and href.startswith('#'):
-                binary = tree.find(f"fb:binary[@id='{href[1:]}']", namespaces=ns)
-                if binary is not None and binary.text:
-                    return binary.text.encode(encoding).decode('utf-8', errors='replace')
-        return None
-    except Exception as e:
-        logger.error(f"Cover extraction failed: {str(e)}")
-        return None
+        archive_type = get_archive_type(file_path)
+        if not archive_type:
+            return
 
-def extract_meta_from_fb2(file_path):
+        if archive_type == 'zip':
+            with zipfile.ZipFile(file_path) as zf:
+                for name in zf.namelist():
+                    if name.endswith('/'):
+                        continue
+                    
+                    with zf.open(name) as entry:
+                        content = entry.read()
+                        process_content(
+                            content=content,
+                            file_name=name,
+                            root_path=root_path,
+                            depth=depth+1,
+                            parent_archive=file_path
+                        )
+        elif archive_type == 'rar':
+            with rarfile.RarFile(file_path) as rf:
+                for entry in rf.infolist():
+                    if entry.isdir():
+                        continue
+                    
+                    with rf.open(entry) as f:
+                        content = f.read()
+                        process_content(
+                            content=content,
+                            file_name=entry.filename,
+                            root_path=root_path,
+                            depth=depth+1,
+                            parent_archive=file_path
+                        )
+    except (zipfile.BadZipFile, rarfile.RarCannotExec, rarfile.BadRarFile) as e:
+        logger.error(f"Bad archive: {file_path} - {str(e)}")
+    except Exception as e:
+        logger.error(f"Error processing archive: {file_path} - {str(e)}")
+    finally:
+        release_lock(file_path)
+
+def process_content(content, file_name, root_path, depth, parent_archive):
     try:
-        encoding = detect_encoding(file_path)
-        parser = etree.XMLParser(encoding=encoding, recover=True)
-        tree = etree.parse(file_path, parser=parser)
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        mime = magic.from_file(tmp_path, mime=True)
         
-        ns = {'fb': 'http://www.gribuser.ru/xml/fictionbook/2.0'}
-        meta = {
-            'title': "Без названия",
-            'authors': [],
-            'series': None,
-            'series_number': None,
-            'lang': 'ru',
-            'description': '',
-            'keywords': [],
-            'cover': None
-        }
-
-        root = tree.getroot()
-        lang = root.get('lang', 'ru')
-        meta['lang'] = lang.split('-')[0].lower() if lang else 'ru'
-        meta['cover'] = extract_cover_from_fb2(file_path)
-
-        title_info = root.find('fb:description/fb:title-info', namespaces=ns)
-        if title_info is not None:
-            title = title_info.findtext('fb:book-title', namespaces=ns)
-            meta['title'] = title.strip() if title else meta['title']
-
-            for author in title_info.findall('fb:author', namespaces=ns):
-                first = author.findtext('fb:first-name', namespaces=ns, default='').strip()
-                last = author.findtext('fb:last-name', namespaces=ns, default='').strip()
-                middle = author.findtext('fb:middle-name', namespaces=ns, default='').strip()
-                meta['authors'].append({
-                    'first_name': first,
-                    'last_name': last,
-                    'middle_name': middle
-                })
-
-            sequence = title_info.find('fb:sequence', namespaces=ns)
-            if sequence is not None:
-                meta['series'] = sequence.get('name', '').strip()
-                try:
-                    meta['series_number'] = float(sequence.get('number', 0))
-                except (ValueError, TypeError):
-                    meta['series_number'] = None
-
-            for genre in title_info.findall('fb:genre', namespaces=ns):
-                if genre.text:
-                    meta['keywords'].append(genre.text.strip().replace('\n', ' '))
-
-            annotation = title_info.find('fb:annotation', namespaces=ns)
-            if annotation is not None:
-                texts = []
-                for elem in annotation.iter():
-                    if elem.text and elem.tag != '{http://www.gribuser.ru/xml/fictionbook/2.0}annotation':
-                        texts.append(elem.text.strip().replace('\n', ' '))
-                meta['description'] = ' '.join(texts)
-
-        return meta
-    except etree.XMLSyntaxError as e:
-        logger.error(f"Invalid XML in {file_path}: {str(e)}")
-        return None
-    except UnicodeDecodeError as e:
-        logger.error(f"Encoding error in {file_path}: {str(e)}")
-        return None
-    except Exception as e:
-        logger.error(f"FB2 processing error: {str(e)}")
-        return None
+        if mime in SUPPORTED_ARCHIVE_TYPES:
+            process_archive(
+                tmp_path, 
+                root_path,
+                parent_archive=parent_archive,
+                depth=depth+1
+            )
+        elif mime in SUPPORTED_BOOK_FORMATS:
+            process_single_file(
+                file_path=tmp_path,
+                root_path=root_path,
+                parent_archive=parent_archive,
+                rel_in_archive=file_name
+            )
+        else:
+            logger.debug(f"Skipping unsupported file: {file_name}")
+    finally:
+        os.unlink(tmp_path)
