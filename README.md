@@ -1,3 +1,2 @@
-# book_manager
-# book_manager
-# book_manager
+# book_manager (пока тестовое название)
+Проект для каталогизации архива книг на Python 
